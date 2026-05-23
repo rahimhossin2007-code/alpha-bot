@@ -1,0 +1,31 @@
+kind = "web"
+previewPath = "/"
+title = "ALPHA Bot Panel"
+version = "1.0.0"
+id = "artifacts/alpha-panel"
+router = "path"
+
+[[integratedSkills]]
+name = "react-vite"
+version = "1.0.0"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 19325
+
+[services.development]
+run = "pnpm --filter @workspace/alpha-panel run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/alpha-panel", "run", "build" ]
+publicDir = "artifacts/alpha-panel/dist/public"
+serve = "static"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "19325"
+BASE_PATH = "/"

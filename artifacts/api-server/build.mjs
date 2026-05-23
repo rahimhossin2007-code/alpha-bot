@@ -3,14 +3,141 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { build as esbuild } from "esbuild";
 import esbuildPluginPino from "esbuild-plugin-pino";
-import { rm } from "node:fs/promises";
+import { rm, readFile, writeFile } from "node:fs/promises";
 
 // Plugins (e.g. 'esbuild-plugin-pino') may use `require` to resolve dependencies
 globalThis.require = createRequire(import.meta.url);
 
 const artifactDir = path.dirname(fileURLToPath(import.meta.url));
 
+const FCA_BASE = new URL(
+  "../../node_modules/.pnpm/fca-unofficial@1.3.10/node_modules/fca-unofficial/",
+  import.meta.url
+).pathname;
+
+async function patchFcaUnofficial() {
+  // ── Patch 1: utils.js — modern fb_dtsg extraction (DTSGInitData) ──────────
+  try {
+    const p = FCA_BASE + "utils.js";
+    let src = await readFile(p, "utf8");
+    const OLD = `getFrom(html, 'name="fb_dtsg" value="', '"');`;
+    if (!src.includes("DTSGInitData") && src.includes(OLD)) {
+      src = src.replace(
+        OLD,
+        `getFrom(html, 'name="fb_dtsg" value="', '"') ` +
+        `|| (html.match(/\\["DTSGInitData",\\[\\],\\{"token":"([^"]+)"/) || [])[1] ` +
+        `|| (html.match(/"dtsg":\\{"token":"([^"]+)"/) || [])[1] ` +
+        `|| (html.match(/"token":"(AQ[A-Za-z0-9_\\-]{10,})"/) || [])[1] ` +
+        `|| '';`
+      );
+      await writeFile(p, src, "utf8");
+      console.log("[patch] fca-unofficial utils.js: fb_dtsg extraction patched");
+    } else {
+      console.log("[patch] fca-unofficial utils.js: already patched");
+    }
+  } catch (e) {
+    console.warn("[patch] utils.js patch failed:", e.message);
+  }
+
+  // ── Patch 2: index.js — fallback to mbasic.facebook.com on blocked GETs ──
+  try {
+    const p = FCA_BASE + "index.js";
+    let src = await readFile(p, "utf8");
+    const OLD2 = `mainPromise = utils
+      .get('https://www.facebook.com/', jar, null, globalOptions, { noRef: true })
+      .then(utils.saveCookies(jar));`;
+    if (!src.includes("Fallback: www.facebook.com is blocked") && src.includes(OLD2)) {
+      src = src.replace(
+        OLD2,
+        `mainPromise = utils
+      .get('https://www.facebook.com/', jar, null, globalOptions, { noRef: true })
+      .then(utils.saveCookies(jar))
+      .then(function(res) {
+        // Fallback: www.facebook.com is blocked from datacenter IPs -> try mbasic
+        if (!res || !res.body || res.body.length < 5000 || res.body.indexOf('Sorry, something went wrong') > -1) {
+          return utils.get('https://mbasic.facebook.com/', jar, null, globalOptions, { noRef: true }).then(utils.saveCookies(jar));
+        }
+        return res;
+      });`
+      );
+      await writeFile(p, src, "utf8");
+      console.log("[patch] fca-unofficial index.js: mbasic fallback patched");
+    } else {
+      console.log("[patch] fca-unofficial index.js: already patched");
+    }
+  } catch (e) {
+    console.warn("[patch] index.js patch failed:", e.message);
+  }
+
+  // ── Patch 3: listenMqtt.js — handle non-array graphqlbatch response ───────
+  try {
+    const p = FCA_BASE + "src/listenMqtt.js";
+    let src = await readFile(p, "utf8");
+    if (!src.includes("Handle both array format")) {
+      const OLD3 = `        if (utils.getType(resData) != "Array") {
+          throw {
+            error: "Not logged in",
+            res: resData
+          };
+        }
+
+        if (resData && resData[resData.length - 1].error_results > 0) {
+          throw resData[0].o0.errors;
+        }
+
+        if (resData[resData.length - 1].successful_results === 0) {
+          throw { error: "getSeqId: there was no successful_results", res: resData };
+        }
+
+        if (resData[0].o0.data.viewer.message_threads.sync_sequence_id) {
+          ctx.lastSeqId = resData[0].o0.data.viewer.message_threads.sync_sequence_id;
+          listenMqtt(defaultFuncs, api, ctx, globalCallback);
+        } else {
+          throw { error: "getSeqId: no sync_sequence_id found.", res: resData };
+        }`;
+      const NEW3 = `        // Handle both array format (with fb_dtsg) and object format (without fb_dtsg)
+        var seqData = null;
+        if (utils.getType(resData) === "Array") {
+          if (resData && resData[resData.length - 1].error_results > 0) throw resData[0].o0.errors;
+          if (resData[resData.length - 1].successful_results === 0) throw { error: "getSeqId: there was no successful_results", res: resData };
+          seqData = resData[0];
+        } else if (resData && resData.o0) {
+          seqData = resData; // non-array format when fb_dtsg missing
+        } else if (resData && typeof resData.error === 'number') {
+          // Facebook API error (not auth) - use fallback seqID
+          log.warn("getSeqId", "Facebook API error " + resData.error + " - using fallback seqID");
+          ctx.lastSeqId = String(Date.now());
+          return listenMqtt(defaultFuncs, api, ctx, globalCallback);
+        } else {
+          throw { error: "Not logged in", res: resData };
+        }
+        if (seqData && seqData.o0 && seqData.o0.data && seqData.o0.data.viewer &&
+            seqData.o0.data.viewer.message_threads && seqData.o0.data.viewer.message_threads.sync_sequence_id) {
+          ctx.lastSeqId = seqData.o0.data.viewer.message_threads.sync_sequence_id;
+          listenMqtt(defaultFuncs, api, ctx, globalCallback);
+        } else {
+          // seqID null/missing - use fallback
+          log.warn("getSeqId", "sync_sequence_id null - using fallback seqID");
+          ctx.lastSeqId = String(Date.now());
+          listenMqtt(defaultFuncs, api, ctx, globalCallback);
+        }`;
+      if (src.includes(OLD3)) {
+        src = src.replace(OLD3, NEW3);
+        await writeFile(p, src, "utf8");
+        console.log("[patch] fca-unofficial listenMqtt.js: non-array response patched");
+      } else {
+        console.log("[patch] fca-unofficial listenMqtt.js: pattern not found");
+      }
+    } else {
+      console.log("[patch] fca-unofficial listenMqtt.js: already patched");
+    }
+  } catch (e) {
+    console.warn("[patch] listenMqtt.js patch failed:", e.message);
+  }
+}
+
 async function buildAll() {
+  await patchFcaUnofficial();
   const distDir = path.resolve(artifactDir, "dist");
   await rm(distDir, { recursive: true, force: true });
 

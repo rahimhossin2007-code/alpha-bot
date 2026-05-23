@@ -1,18 +1,20 @@
 import { createRequire } from "module";
-import path from "path";
-import fs from "fs";
 import { DATA_DIR, ensureDataDir } from "./dataDir.js";
 import { createLogger } from "./logStore.js";
 import { isAdmin } from "./adminSystem.js";
-import { loadCookies, watchCookie, parseCookieInput, validateCookies, saveCookies } from "./cookieStore.js";
+import { loadCookies, watchCookie, validateCookies, saveCookies } from "./cookieStore.js";
 import { loadCommands, getCommands } from "./commandLoader.js";
 import { incrementMessages, incrementCommands, incrementErrors } from "./statsTracker.js";
-import type { FcaApi, FcaEvent, BotStatus, CommandContext } from "./types.js";
+import type { FcaApi, FcaEvent, BotStatus, CommandContext, CookieEntry } from "./types.js";
 
 const require = createRequire(import.meta.url);
 const log = createLogger("BOT");
 
 const PREFIX = process.env["BOT_PREFIX"] ?? "/";
+
+const UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+  "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
 export interface BotState {
   status: BotStatus;
@@ -36,17 +38,13 @@ const state: BotState = {
 
 let _loginLock = false;
 let _stopListener: (() => void) | null = null;
-let _listenTimer: ReturnType<typeof setTimeout> | null = null;
 let _reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+let _retryTimer: ReturnType<typeof setTimeout> | null = null;
 
 function stopListening(): void {
   if (_stopListener) {
     try { _stopListener(); } catch {}
     _stopListener = null;
-  }
-  if (_listenTimer) {
-    clearTimeout(_listenTimer);
-    _listenTimer = null;
   }
 }
 
@@ -80,10 +78,7 @@ function handleEvent(api: FcaApi, event: FcaEvent): void {
   if (!body.startsWith(PREFIX)) return;
 
   const senderID = event.senderID;
-
-  if (!isAdmin(senderID)) {
-    return;
-  }
+  if (!isAdmin(senderID)) return;
 
   const parts = body.slice(PREFIX.length).trim().split(/\s+/);
   const commandName = parts[0]?.toLowerCase() ?? "";
@@ -92,11 +87,6 @@ function handleEvent(api: FcaApi, event: FcaEvent): void {
   const commands = getCommands();
   const cmd = commands.get(commandName);
   if (!cmd) return;
-
-  if (cmd.adminOnly && !isAdmin(senderID)) {
-    api.sendMessage("This command is restricted to bot admins.", event.threadID!);
-    return;
-  }
 
   incrementCommands();
   const ctx = buildCommandContext();
@@ -109,72 +99,174 @@ function handleEvent(api: FcaApi, event: FcaEvent): void {
     });
 }
 
-function startPolling(api: FcaApi, attempt = 1): void {
-  const MAX = 3;
-  log.info(`Starting HTTP Long-Poll (attempt ${attempt}/${MAX})...`);
-  let started = false;
+// ── Messenger Session Bootstrap ────────────────────────────────────────────
+// Fetches facebook.com/messages/ before fca login to:
+//  1. Establish a Messenger session → sets m_sess cookie in response headers
+//  2. Extract irisSeqID / sync_sequence_id from the HTML
+// Both are needed for getSeqID() in fca-unofficial to succeed.
+async function bootstrapMessengerSession(cookies: CookieEntry[]): Promise<{
+  enrichedCookies: CookieEntry[];
+  irisSeqID: string | null;
+  fb_dtsg: string | null;
+}> {
+  const cookieHeader = cookies.map(c => `${c.key}=${c.value}`).join("; ");
 
-  const stop = api.listen((err, event) => {
-    if (err) {
-      const msg = String((err as any).error ?? (err as any).message ?? err);
-      log.error(`Poll error: ${msg}`);
-      if (attempt < MAX) {
-        setTimeout(() => startPolling(api, attempt + 1), attempt * 8000);
+  try {
+    const controller = new AbortController();
+    const tid = setTimeout(() => controller.abort(), 20000);
+
+    const res = await fetch("https://www.facebook.com/messages/t/", {
+      headers: {
+        Cookie: cookieHeader,
+        "User-Agent": UA,
+        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        Referer: "https://www.facebook.com/",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "same-origin",
+      },
+      redirect: "follow",
+      signal: controller.signal,
+    });
+
+    clearTimeout(tid);
+
+    const html = await res.text();
+
+    // Try multiple patterns for the sequence ID
+    let irisSeqID: string | null = null;
+    const seqPatterns = [
+      /irisSeqID:"(\d+)"/,
+      /"iris_seq_id":"(\d+)"/,
+      /"sync_sequence_id":"(\d+)"/,
+      /initial_titan_sequence_id":"(\d+)"/,
+      /"initialTitanSequenceID":"(\d+)"/,
+    ];
+    for (const p of seqPatterns) {
+      const m = html.match(p);
+      if (m?.[1]) { irisSeqID = m[1]; break; }
+    }
+
+    // Extract new cookies from Set-Cookie response headers
+    const enrichedCookies = [...cookies];
+    type GetSetCookies = () => string[];
+    const setCookieHeaders: string[] =
+      (res.headers as unknown as { getSetCookie?: GetSetCookies }).getSetCookie?.() ?? [];
+
+    let newCookieCount = 0;
+    for (const header of setCookieHeaders) {
+      const parts = header.split(";");
+      const eqIdx = (parts[0] ?? "").indexOf("=");
+      if (eqIdx < 0) continue;
+      const k = parts[0]!.slice(0, eqIdx).trim();
+      const v = parts[0]!.slice(eqIdx + 1).trim();
+      if (!k) continue;
+
+      const idx = enrichedCookies.findIndex(c => c.key === k);
+      const entry: CookieEntry = { key: k, value: v, domain: ".facebook.com", path: "/" };
+      if (idx >= 0) {
+        enrichedCookies[idx] = { ...enrichedCookies[idx], ...entry };
       } else {
-        state.status = "error";
-        state.errorMessage = "Max reconnect attempts reached";
+        enrichedCookies.push(entry);
+        newCookieCount++;
       }
-      return;
     }
-    if (!started) {
-      started = true;
-      state.connectionType = "long-poll";
-      log.ok(`Long-Poll active — UID: ${api.getCurrentUserID()}`);
+
+    // Also try to extract fb_dtsg token from the HTML (fca-unofficial needs this for GraphQL POSTs)
+    let fb_dtsg: string | null = null;
+    const dtsgPatterns = [
+      /\["DTSGInitData",\[\],\{"token":"([^"]+)"/,
+      /"dtsg":\{"token":"([^"]+)"/,
+      /name="fb_dtsg" value="([^"]+)"/,
+      /"token":"(AQ[A-Za-z0-9_\-]{10,})"/,
+    ];
+    for (const p of dtsgPatterns) {
+      const m = html.match(p);
+      if (m?.[1]) { fb_dtsg = m[1]; break; }
     }
-    handleEvent(api, event);
-  });
-  _stopListener = stop;
+
+    if (fb_dtsg) log.ok(`Got fb_dtsg from messages page: ${fb_dtsg.slice(0, 12)}...`);
+    if (irisSeqID) log.ok(`Got irisSeqID from messages page: ${irisSeqID}`);
+    if (newCookieCount > 0) log.ok(`Got ${newCookieCount} new cookies from Messenger (incl. m_sess)`);
+    if (!fb_dtsg && !irisSeqID && newCookieCount === 0) {
+      log.warn("Bootstrap: no new cookies, seqID, or fb_dtsg — session may have expired or needs refresh");
+    }
+
+    return { enrichedCookies, irisSeqID, fb_dtsg };
+  } catch (err: any) {
+    if (err?.name === "AbortError") {
+      log.warn("Messenger bootstrap timed out");
+    } else {
+      log.warn(`Messenger bootstrap failed: ${err?.message}`);
+    }
+    return { enrichedCookies: cookies, irisSeqID: null };
+  }
+}
+
+// ── MQTT listener ──────────────────────────────────────────────────────────
+function scheduleRetry(delayMs = 120000): void {
+  if (_retryTimer) return;
+  log.warn(`Listener failed — retrying in ${Math.round(delayMs / 1000)}s...`);
+  state.status = "error";
+  state.errorMessage =
+    "Messenger API rejected session (error 1357001). " +
+    "Update cookies from an active Messenger browser session, or wait for auto-retry.";
+  _retryTimer = setTimeout(() => {
+    _retryTimer = null;
+    log.info("Auto-retry triggered...");
+    startBot().catch(() => {});
+  }, delayMs);
 }
 
 function startMqtt(api: FcaApi, attempt = 1): void {
-  const MAX = 4;
+  const MAX = 5;
   log.info(`MQTT connecting (attempt ${attempt}/${MAX})...`);
-  let mqttOk = false;
+  let connected = false;
 
-  const timer = setTimeout(() => {
-    if (!mqttOk) {
-      log.warn("MQTT timeout — falling back to Long-Poll");
-      startPolling(api);
-    }
-  }, 22000);
-  _listenTimer = timer;
+  // api.listen === api.listenMqtt in fca-unofficial v1.3.x
+  const listenFn: ((cb: (err: any, ev: FcaEvent) => void) => any) =
+    (api as any).listenMqtt ?? (api as any).listen;
 
-  const listenFn = api.listenMqtt ?? api.listen;
-  const stop = listenFn.call(api, (err: any, event: FcaEvent) => {
+  if (!listenFn) {
+    log.error("fca-unofficial has no listen function — cannot start");
+    scheduleRetry();
+    return;
+  }
+
+  const emitter = listenFn.call(api, (err: any, event: FcaEvent) => {
     if (err) {
-      clearTimeout(timer);
-      const msg = String(err?.error ?? err?.message ?? err?.type ?? err);
+      const msg = String(err?.error ?? err?.message ?? err?.type ?? JSON.stringify(err));
       log.warn(`MQTT error: ${msg} (${attempt}/${MAX})`);
+
       if (attempt < MAX) {
-        setTimeout(() => startMqtt(api, attempt + 1), Math.min(attempt * 8000, 40000));
+        const delay = Math.min(attempt * 10000, 60000);
+        setTimeout(() => startMqtt(api, attempt + 1), delay);
       } else {
-        startPolling(api);
+        scheduleRetry(120000);
       }
       return;
     }
-    if (!mqttOk) {
-      mqttOk = true;
-      clearTimeout(timer);
-      _listenTimer = null;
+
+    if (!connected) {
+      connected = true;
       state.connectionType = "mqtt";
+      state.status = "online";
+      state.errorMessage = null;
       log.ok(`MQTT connected — UID: ${api.getCurrentUserID()}`);
     }
+
     handleEvent(api, event);
   });
-  if (stop) _stopListener = stop;
-  else { clearTimeout(timer); startPolling(api); }
+
+  // Store stop function — listenMqtt returns a MessageEmitter with stopListening()
+  if (emitter && typeof emitter.stopListening === "function") {
+    _stopListener = () => emitter.stopListening(() => {});
+  }
 }
 
+// ── Main login + start ─────────────────────────────────────────────────────
 export async function startBot(): Promise<void> {
   if (_loginLock) {
     log.warn("Login already in progress — ignoring");
@@ -182,6 +274,7 @@ export async function startBot(): Promise<void> {
   }
   _loginLock = true;
   if (_reconnectTimer) { clearTimeout(_reconnectTimer); _reconnectTimer = null; }
+  if (_retryTimer) { clearTimeout(_retryTimer); _retryTimer = null; }
 
   stopListening();
   state.api = null;
@@ -193,16 +286,16 @@ export async function startBot(): Promise<void> {
 
   loadCommands();
 
-  const cookies = loadCookies();
-  if (!cookies) {
+  const rawCookies = loadCookies();
+  if (!rawCookies) {
     log.error("No cookies found — upload them via the panel");
     state.status = "offline";
-    state.errorMessage = "No cookies — upload via panel";
+    state.errorMessage = "No cookies — upload via Cookie Management";
     _loginLock = false;
     return;
   }
 
-  if (!validateCookies(cookies)) {
+  if (!validateCookies(rawCookies)) {
     log.error("Invalid cookies — missing c_user or xs");
     state.status = "error";
     state.errorMessage = "Invalid cookies (missing c_user or xs)";
@@ -210,13 +303,21 @@ export async function startBot(): Promise<void> {
     return;
   }
 
-  // URL-decode cookie values and normalise domain format
-  const normalizedCookies = cookies.map((c) => ({
+  // Normalize: URL-decode values, ensure domain has leading dot
+  const normalized: CookieEntry[] = rawCookies.map(c => ({
     ...c,
     value: (() => { try { return decodeURIComponent(c.value); } catch { return c.value; } })(),
     domain: c.domain?.startsWith(".") ? c.domain : `.${c.domain}`,
   }));
 
+  // ── STEP 1: Bootstrap Messenger session ──────────────────────────────────
+  log.info("Bootstrapping Messenger session...");
+  const { enrichedCookies } = await bootstrapMessengerSession(normalized);
+
+  // Save enriched cookies (with m_sess) so the watchdog doesn't re-trigger
+  try { saveCookies(enrichedCookies, true); } catch {}
+
+  // ── STEP 2: fca-unofficial login ──────────────────────────────────────────
   let fcaLogin: (creds: any, opts: any, cb: (err: any, api: FcaApi) => void) => void;
   try {
     fcaLogin = require("fca-unofficial") as typeof fcaLogin;
@@ -237,18 +338,16 @@ export async function startBot(): Promise<void> {
     attempt++;
     log.info(`Login attempt ${attempt}/${MAX_ATTEMPTS}...`);
 
-    const UA =
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-      "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
-
     fcaLogin(
-      { appState: normalizedCookies },
+      { appState: enrichedCookies },
       {
         logLevel: "silent",
         selfListen: false,
-        listenEvents: false,
-        forceLogin: false,
+        listenEvents: true,
+        forceLogin: true,
         userAgent: UA,
+        autoMarkDelivery: false,
+        autoMarkRead: false,
       },
       async (err, api) => {
         if (err) {
@@ -266,13 +365,13 @@ export async function startBot(): Promise<void> {
 
         const uid = api.getCurrentUserID();
 
+        // Persist updated appState (fca may have refreshed tokens)
         try {
-          const appState = (api as any).getAppState?.() as any[];
-          if (appState?.length) {
-            saveCookies(appState, true);
-          }
+          const appState = (api as any).getAppState?.() as CookieEntry[] | undefined;
+          if (appState?.length) saveCookies(appState, true);
         } catch {}
 
+        // Resolve display name
         let botName = "ALPHA Bot";
         try {
           const info = await new Promise<Record<string, any>>((res, rej) =>
@@ -291,11 +390,8 @@ export async function startBot(): Promise<void> {
         log.ok(`Logged in as ${botName} (UID: ${uid})`);
         _loginLock = false;
 
-        if (typeof api.listenMqtt === "function") {
-          startMqtt(api);
-        } else {
-          startPolling(api);
-        }
+        // ── STEP 3: Start MQTT listener ───────────────────────────────────
+        startMqtt(api);
       }
     );
   }
@@ -304,6 +400,8 @@ export async function startBot(): Promise<void> {
 }
 
 export function stopBot(): void {
+  if (_retryTimer) { clearTimeout(_retryTimer); _retryTimer = null; }
+  if (_reconnectTimer) { clearTimeout(_reconnectTimer); _reconnectTimer = null; }
   stopListening();
   state.api = null;
   state.status = "offline";
@@ -335,7 +433,6 @@ export function initBot(): void {
   log.info("ALPHA Bot initializing...");
 
   watchCookie(() => {
-    if (state.status === "offline" || state.status === "error") return;
     log.info("Cookie changed — reconnecting...");
     restartBot();
   });
